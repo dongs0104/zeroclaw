@@ -1103,7 +1103,7 @@ impl Channel for MatrixChannel {
 
                 // Voice transcription: if this was an audio message, transcribe it
                 let body = if body.starts_with("[audio:") {
-                    if let (Some(path_start), Some(ref manager)) = (body.find("saved to "), &transcription_mgr) {
+                    if let (Some(path_start), Some(manager)) = (body.find("saved to "), &transcription_mgr) {
                         let audio_path = body[path_start + 9..].to_string();
                         let file_name = audio_path
                             .rsplit('/')
