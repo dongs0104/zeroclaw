@@ -127,9 +127,11 @@ impl MattermostChannel {
     /// Returns the static `bot_token` when configured. Otherwise, returns
     /// (and caches) a session token obtained via `login_for_token()`.
     async fn effective_token(&self) -> Result<String> {
-        // Fast path: static bot token.
+        // Fast path: static bot token (skip empty strings).
         if let Some(ref token) = self.bot_token {
-            return Ok(token.clone());
+            if !token.trim().is_empty() {
+                return Ok(token.clone());
+            }
         }
 
         // Check cached session token.
@@ -626,16 +628,24 @@ impl Channel for MattermostChannel {
 
     async fn listen(&self, tx: tokio::sync::mpsc::Sender<ChannelMessage>) -> Result<()> {
         // Validate that we have at least one auth method.
-        if self.bot_token.is_none()
-            && (self.bot_id.is_none() || self.bot_password.is_none())
-        {
+        // Treat empty/whitespace-only bot_token the same as None.
+        let has_bot_token = self
+            .bot_token
+            .as_deref()
+            .is_some_and(|t| !t.trim().is_empty());
+        let has_credentials = self.bot_id.as_deref().is_some_and(|s| !s.trim().is_empty())
+            && self
+                .bot_password
+                .as_deref()
+                .is_some_and(|s| !s.trim().is_empty());
+        if !has_bot_token && !has_credentials {
             bail!(
                 "Mattermost requires either bot_token or both bot_id and bot_password"
             );
         }
         match self.listen_mode {
             ListenMode::WebSocket => {
-                if self.bot_id.is_none() || self.bot_password.is_none() {
+                if !has_credentials {
                     bail!(
                         "Mattermost WebSocket mode requires both bot_id and bot_password"
                     );
