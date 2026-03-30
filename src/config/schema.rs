@@ -2045,6 +2045,14 @@ pub struct GatewayConfig {
     #[serde(default)]
     pub path_prefix: Option<String>,
 
+    /// When `true`, the reverse proxy strips `path_prefix` before forwarding,
+    /// so the gateway routes at `/` instead of nesting under the prefix.
+    /// The prefix is still used for asset URL rewriting in the web dashboard.
+    /// Typical for k8s Ingress with `nginx.ingress.kubernetes.io/rewrite-target`.
+    /// Default: `false`.
+    #[serde(default)]
+    pub proxy_strips_prefix: bool,
+
     /// Maximum distinct client keys tracked by gateway rate limiter maps.
     #[serde(default = "default_gateway_rate_limit_max_keys")]
     pub rate_limit_max_keys: usize,

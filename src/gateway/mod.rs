@@ -1024,12 +1024,21 @@ pub async fn run_gateway(host: &str, port: u16, config: Config) -> Result<()> {
     // Nest under path prefix when configured (axum strips prefix before routing).
     // nest() at "/prefix" handles both "/prefix" and "/prefix/*" but not "/prefix/"
     // with a trailing slash, so we add a fallback redirect for that case.
+    //
+    // When `proxy_strips_prefix` is true, the reverse proxy (e.g. k8s Ingress
+    // with rewrite-target) already strips the prefix before forwarding, so the
+    // gateway receives requests at `/`.  In that case we skip nesting but the
+    // prefix is still used for asset URL rewriting in the web dashboard HTML.
     let app = if let Some(prefix) = path_prefix {
-        let redirect_target = prefix.to_string();
-        Router::new().nest(prefix, inner).route(
-            &format!("{prefix}/"),
-            get(|| async move { axum::response::Redirect::permanent(&redirect_target) }),
-        )
+        if config.gateway.proxy_strips_prefix {
+            inner
+        } else {
+            let redirect_target = prefix.to_string();
+            Router::new().nest(prefix, inner).route(
+                &format!("{prefix}/"),
+                get(|| async move { axum::response::Redirect::permanent(&redirect_target) }),
+            )
+        }
     } else {
         inner
     };
