@@ -21,6 +21,7 @@ pub mod sse;
 pub mod static_files;
 pub mod tls;
 pub mod ws;
+pub mod ws_channel;
 
 use crate::channels::{
     Channel, GmailPushChannel, LinqChannel, NextcloudTalkChannel, SendMessage, WatiChannel,
