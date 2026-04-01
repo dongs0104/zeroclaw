@@ -189,6 +189,30 @@ async fn handle_socket(
     };
     agent.set_memory_session_id(Some(session_id.clone()));
 
+    // ── Wire WsChannel for ask_user / escalate_to_human ────────────
+    // These mpsc channels bridge the agent's Channel-based tools with
+    // the WebSocket connection.  `ask_outgoing_rx` is drained by the
+    // forward loop; `ws_incoming_tx` is fed when the client sends an
+    // `ask_user_response` message.
+    let (ask_outgoing_tx, ask_outgoing_rx) =
+        tokio::sync::mpsc::channel::<String>(8);
+    let (ws_incoming_tx, ws_incoming_rx) =
+        tokio::sync::mpsc::channel::<crate::channels::traits::ChannelMessage>(8);
+
+    let ws_channel: std::sync::Arc<dyn crate::channels::traits::Channel> =
+        std::sync::Arc::new(super::ws_channel::WsChannel::new(
+            "websocket",
+            ask_outgoing_tx,
+            ws_incoming_rx,
+        ));
+
+    if let Some(handle) = agent.channel_map_handle() {
+        let mut map = handle.write();
+        map.insert("websocket".to_string(), ws_channel);
+    }
+
+    let ask_outgoing_rx = std::sync::Arc::new(tokio::sync::Mutex::new(ask_outgoing_rx));
+
     // Hydrate agent from persisted session (if available)
     let mut resumed = false;
     let mut message_count: usize = 0;
@@ -280,8 +304,17 @@ async fn handle_socket(
                         let user_msg = crate::providers::ChatMessage::user(&content);
                         let _ = backend.append(&session_key, &user_msg);
                     }
-                    process_chat_message(&state, &mut agent, &mut sender, &content, &session_key)
-                        .await;
+                    process_chat_message(
+                        &state,
+                        &mut agent,
+                        &mut sender,
+                        &mut receiver,
+                        &content,
+                        &session_key,
+                        &ask_outgoing_rx,
+                        &ws_incoming_tx,
+                    )
+                    .await;
                 }
             } else {
                 let unknown_type = parsed["type"].as_str().unwrap_or("unknown");
@@ -367,7 +400,17 @@ async fn handle_socket(
             let _ = backend.append(&session_key, &user_msg);
         }
 
-        process_chat_message(&state, &mut agent, &mut sender, &content, &session_key).await;
+        process_chat_message(
+            &state,
+            &mut agent,
+            &mut sender,
+            &mut receiver,
+            &content,
+            &session_key,
+            &ask_outgoing_rx,
+            &ws_incoming_tx,
+        )
+        .await;
     }
 }
 
@@ -375,12 +418,20 @@ async fn handle_socket(
 ///
 /// Uses [`Agent::turn_streamed`] so that intermediate text chunks, tool calls,
 /// and tool results are forwarded to the WebSocket client in real time.
+///
+/// The `receiver` and `ask_user` channels are used to support interactive
+/// `ask_user` / `escalate_to_human` tools during the turn: outgoing questions
+/// are forwarded over the WebSocket, and `ask_user_response` messages from the
+/// client are routed back to the tool.
 async fn process_chat_message(
     state: &AppState,
     agent: &mut crate::agent::Agent,
     sender: &mut futures_util::stream::SplitSink<WebSocket, Message>,
+    receiver: &mut futures_util::stream::SplitStream<WebSocket>,
     content: &str,
     session_key: &str,
+    ask_outgoing_rx: &std::sync::Arc<tokio::sync::Mutex<tokio::sync::mpsc::Receiver<String>>>,
+    ws_incoming_tx: &tokio::sync::mpsc::Sender<crate::channels::traits::ChannelMessage>,
 ) {
     use crate::agent::TurnEvent;
 
@@ -416,24 +467,85 @@ async fn process_chat_message(
     let turn_fut = async { agent.turn_streamed(&content_owned, event_tx).await };
 
     // Drive both futures concurrently: the agent turn produces events
-    // and we relay them over WebSocket.
+    // and we relay them over WebSocket.  Additionally we multiplex
+    // ask_user outgoing questions and incoming responses from the client.
     let forward_fut = async {
-        while let Some(event) = event_rx.recv().await {
-            let ws_msg = match event {
-                TurnEvent::Chunk { delta } => {
-                    serde_json::json!({ "type": "chunk", "content": delta })
+        let mut ask_rx = ask_outgoing_rx.lock().await;
+        let mut turn_done = false;
+        loop {
+            tokio::select! {
+                event = event_rx.recv(), if !turn_done => {
+                    match event {
+                        Some(event) => {
+                            let ws_msg = match event {
+                                TurnEvent::Chunk { delta } => {
+                                    serde_json::json!({ "type": "chunk", "content": delta })
+                                }
+                                TurnEvent::Thinking { delta } => {
+                                    serde_json::json!({ "type": "thinking", "content": delta })
+                                }
+                                TurnEvent::ToolCall { name, args } => {
+                                    serde_json::json!({ "type": "tool_call", "name": name, "args": args })
+                                }
+                                TurnEvent::ToolResult { name, output } => {
+                                    serde_json::json!({ "type": "tool_result", "name": name, "output": output })
+                                }
+                            };
+                            let _ = sender.send(Message::Text(ws_msg.to_string().into())).await;
+                        }
+                        None => {
+                            // Agent turn finished — stop polling event_rx
+                            turn_done = true;
+                        }
+                    }
                 }
-                TurnEvent::Thinking { delta } => {
-                    serde_json::json!({ "type": "thinking", "content": delta })
+                question = ask_rx.recv() => {
+                    if let Some(q) = question {
+                        let ws_msg = serde_json::json!({
+                            "type": "ask_user",
+                            "question": q,
+                        });
+                        let _ = sender.send(Message::Text(ws_msg.to_string().into())).await;
+                    }
                 }
-                TurnEvent::ToolCall { name, args } => {
-                    serde_json::json!({ "type": "tool_call", "name": name, "args": args })
+                ws_msg = receiver.next() => {
+                    match ws_msg {
+                        Some(Ok(Message::Text(text))) => {
+                            if let Ok(parsed) = serde_json::from_str::<serde_json::Value>(&text) {
+                                if parsed["type"].as_str() == Some("ask_user_response") {
+                                    let resp_content = parsed["content"]
+                                        .as_str()
+                                        .unwrap_or("")
+                                        .to_string();
+                                    let msg = crate::channels::traits::ChannelMessage {
+                                        id: uuid::Uuid::new_v4().to_string(),
+                                        sender: "user".to_string(),
+                                        reply_target: "user".to_string(),
+                                        content: resp_content,
+                                        channel: "websocket".to_string(),
+                                        timestamp: std::time::SystemTime::now()
+                                            .duration_since(std::time::UNIX_EPOCH)
+                                            .map(|d| d.as_secs())
+                                            .unwrap_or(0),
+                                        thread_ts: None,
+                                        interruption_scope_id: None,
+                                        attachments: vec![],
+                                    };
+                                    let _ = ws_incoming_tx.send(msg).await;
+                                }
+                                // Ignore other message types during a turn
+                            }
+                        }
+                        Some(Ok(Message::Close(_))) | Some(Err(_)) | None => {
+                            break;
+                        }
+                        _ => {}
+                    }
                 }
-                TurnEvent::ToolResult { name, output } => {
-                    serde_json::json!({ "type": "tool_result", "name": name, "output": output })
-                }
-            };
-            let _ = sender.send(Message::Text(ws_msg.to_string().into())).await;
+            }
+            if turn_done {
+                break;
+            }
         }
     };
 

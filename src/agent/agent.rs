@@ -11,6 +11,7 @@ use crate::providers::{self, ChatMessage, ChatRequest, ConversationMessage, Prov
 use crate::runtime;
 use crate::security::SecurityPolicy;
 use crate::tools::{self, Tool, ToolSpec};
+use crate::tools::ask_user::ChannelMapHandle;
 use anyhow::Result;
 use chrono::{Datelike, Timelike};
 use std::collections::HashMap;
@@ -71,6 +72,9 @@ pub struct Agent {
     /// When MCP deferred loading is enabled, tools are activated via `tool_search`
     /// and stored here for lookup during tool execution.
     activated_tools: Option<Arc<std::sync::Mutex<crate::tools::ActivatedToolSet>>>,
+    /// Late-bound channel map for `ask_user` / `escalate_to_human` tools.
+    /// Populated after construction to wire WebSocket or other channels.
+    channel_map_handle: Option<ChannelMapHandle>,
 }
 
 pub struct AgentBuilder {
@@ -99,6 +103,7 @@ pub struct AgentBuilder {
     security_summary: Option<String>,
     autonomy_level: Option<crate::security::AutonomyLevel>,
     activated_tools: Option<Arc<std::sync::Mutex<crate::tools::ActivatedToolSet>>>,
+    channel_map_handle: Option<ChannelMapHandle>,
 }
 
 impl AgentBuilder {
@@ -129,6 +134,7 @@ impl AgentBuilder {
             security_summary: None,
             autonomy_level: None,
             activated_tools: None,
+            channel_map_handle: None,
         }
     }
 
@@ -269,6 +275,11 @@ impl AgentBuilder {
         self
     }
 
+    pub fn channel_map_handle(mut self, handle: Option<ChannelMapHandle>) -> Self {
+        self.channel_map_handle = handle;
+        self
+    }
+
     pub fn build(self) -> Result<Agent> {
         let mut tools = self
             .tools
@@ -325,6 +336,7 @@ impl AgentBuilder {
                 .autonomy_level
                 .unwrap_or(crate::security::AutonomyLevel::Supervised),
             activated_tools: self.activated_tools,
+            channel_map_handle: self.channel_map_handle,
         })
     }
 }
@@ -344,6 +356,12 @@ impl Agent {
 
     pub fn set_memory_session_id(&mut self, session_id: Option<String>) {
         self.memory_session_id = session_id;
+    }
+
+    /// Return the shared channel map handle so callers can populate it with
+    /// channel implementations (e.g. a WebSocket channel) after construction.
+    pub fn channel_map_handle(&self) -> Option<&ChannelMapHandle> {
+        self.channel_map_handle.as_ref()
     }
 
     /// Hydrate the agent with prior chat messages (e.g. from a session backend).
@@ -399,7 +417,7 @@ impl Agent {
             delegate_handle,
             _reaction_handle,
             _channel_map_handle,
-            _ask_user_handle,
+            ask_user_handle,
             _escalate_handle,
         ) = tools::all_tools_with_runtime(
             Arc::new(config.clone()),
@@ -556,6 +574,7 @@ impl Agent {
             .security_summary(Some(security.prompt_summary()))
             .autonomy_level(config.autonomy.level)
             .activated_tools(activated_tools)
+            .channel_map_handle(ask_user_handle)
             .build()
     }
 
