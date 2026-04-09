@@ -110,13 +110,20 @@ pub async fn handle_api_status(
         channels.insert(channel.name().to_string(), serde_json::Value::Bool(present));
     }
 
+    let locale = config
+        .locale
+        .as_deref()
+        .filter(|s| !s.is_empty())
+        .map(String::from)
+        .unwrap_or_else(crate::i18n::detect_locale);
+
     let body = serde_json::json!({
         "provider": config.default_provider,
         "model": state.model,
         "temperature": state.temperature,
         "uptime_seconds": health.uptime_seconds,
         "gateway_port": config.gateway.port,
-        "locale": "en",
+        "locale": locale,
         "memory_backend": state.mem.name(),
         "paired": state.pairing.is_paired(),
         "channels": channels,
@@ -1000,7 +1007,8 @@ fn mask_sensitive_fields(config: &crate::config::Config) -> crate::config::Confi
         mask_optional_secret(&mut slack.app_token);
     }
     if let Some(mattermost) = masked.channels_config.mattermost.as_mut() {
-        mask_required_secret(&mut mattermost.bot_token);
+        mask_optional_secret(&mut mattermost.bot_token);
+        mask_optional_secret(&mut mattermost.bot_password);
     }
     if let Some(webhook) = masked.channels_config.webhook.as_mut() {
         mask_optional_secret(&mut webhook.secret);
@@ -1134,7 +1142,7 @@ fn restore_masked_sensitive_fields(
         incoming.channels_config.mattermost.as_mut(),
         current.channels_config.mattermost.as_ref(),
     ) {
-        restore_required_secret(&mut incoming_ch.bot_token, &current_ch.bot_token);
+        restore_optional_secret(&mut incoming_ch.bot_token, &current_ch.bot_token);
     }
     if let (Some(incoming_ch), Some(current_ch)) = (
         incoming.channels_config.webhook.as_mut(),
@@ -1636,6 +1644,7 @@ mod tests {
             tools_registry: Arc::new(Vec::new()),
             cost_tracker: None,
             event_tx: tokio::sync::broadcast::channel(16).0,
+            event_buffer: Arc::new(crate::gateway::sse::EventBuffer::new(16)),
             shutdown_tx: tokio::sync::watch::channel(false).0,
             node_registry: Arc::new(nodes::NodeRegistry::new(16)),
             session_backend: None,
@@ -1672,6 +1681,7 @@ mod tests {
         });
         cfg.memory.qdrant.api_key = Some("qdrant-key".to_string());
         cfg.channels_config.wati = Some(crate::config::schema::WatiConfig {
+            enabled: true,
             api_token: "wati-token".to_string(),
             api_url: "https://live-mt-server.wati.io".to_string(),
             tenant_id: None,
@@ -1679,6 +1689,7 @@ mod tests {
             proxy_url: None,
         });
         cfg.channels_config.feishu = Some(crate::config::schema::FeishuConfig {
+            enabled: true,
             app_id: "cli_aabbcc".to_string(),
             app_secret: "feishu-secret".to_string(),
             encrypt_key: Some("feishu-encrypt".to_string()),
@@ -1809,6 +1820,7 @@ mod tests {
         });
         current.memory.qdrant.api_key = Some("qdrant-real".to_string());
         current.channels_config.wati = Some(crate::config::schema::WatiConfig {
+            enabled: true,
             api_token: "wati-real".to_string(),
             api_url: "https://live-mt-server.wati.io".to_string(),
             tenant_id: None,
@@ -1816,6 +1828,7 @@ mod tests {
             proxy_url: None,
         });
         current.channels_config.feishu = Some(crate::config::schema::FeishuConfig {
+            enabled: true,
             app_id: "cli_current".to_string(),
             app_secret: "feishu-secret-real".to_string(),
             encrypt_key: Some("feishu-encrypt-real".to_string()),
